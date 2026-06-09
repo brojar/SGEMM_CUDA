@@ -1,42 +1,41 @@
-# Fast CUDA SGEMM from Scratch
+# 概述
+- 优化kernel 6，将LD A/B SMEM的过程也使用大位宽数据的方式，性能有所提升。代码存放为kernel 13。
+- 修改kernel 7中，为解决Bs的bank conflicts，对Bs每个元素按照一个warp中的每个thread进行interleave排布的方式，更改为大位宽（128b）数据的XOR Swizzling方式, 代码存放为kernel 14。
 
-Step-by-step optimization of matrix multiplication, implemented in CUDA.
-For an explanation of each kernel, see [siboehm.com/CUDA-MMM](https://siboehm.com/articles/22/CUDA-MMM).
+| 核函数   | GFLOPS | 核函数 | GFLOPS  
+| -------- | ---------- | --------  | ----------
+| kernel_6 | 5492.5     | kernel_13 | 5622.5
+| kernel_7 | 5769.0     | kernel_14 | 5762.4
 
-## Overview
+```
+NVIDIA GeForce GTX 1080，矩阵尺寸4096
+编译采用 MSVC 14.24/ NVCC under Windows 10
+NVIDIA CUDA version: CUDA 12.6
+```
 
-Running the kernels on a NVIDIA A6000 (Ampere):
+# 说明
+## 使用LDS.128读取SMEM数据
+使用`reinterpret_cast<float4*>`的类型转换可以编译得到128位大位宽的访存指令。kernel6原代码使用顺序LOAD SMEM的代码可以优化成大位宽的形式。
+```cpp
+      for (uint i = 0; i < TM; ++i) {
+        regM[i] = As[dotIdx * BM + threadRow * TM + i];
+      }
+      for (uint i = 0; i < TN; ++i) {
+        regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+      }
+```
 
-![](benchmark_results.png)
+## 分阶段进行大位宽访问SMEM
+SMEM的最大访问带宽是128字节，对于4字节（float）的访问，刚好能满足一个warp里的所有线程同时进行。
+而对于16字节（float4）或8字节（float2）的大带宽访存，则需要分阶段进行访存。对于16字节：每个阶段处理1个wrap中的每8个线程。
+因此在bank conflicts的问题上，只有考虑每8个线程间是否冲突，而不需要考虑所有32个个线程。
 
-GFLOPs at matrix size 4096x4096:
-<!-- benchmark_results -->
-| Kernel                              |  GFLOPs/s | Performance relative to cuBLAS |
-|:------------------------------------|----------:|:-------------------------------|
-| 1: Naive                            |   `309.0` | 1.3%                           |
-| 2: GMEM Coalescing                  |  `1986.5` | 8.5%                           |
-| 3: SMEM Caching                     |  `2980.3` | 12.8%                          |
-| 4: 1D Blocktiling                   |  `8474.7` | 36.5%                          |
-| 5: 2D Blocktiling                   | `15971.7` | 68.7%                          |
-| 7: Avoid Bank Conflicts (Linearize) | `16213.4` | 69.7%                          |
-| 8: Avoid Bank Conflicts (Offset)    | `16459.2` | 70.8%                          |
-| 11: Double Buffering                | `17278.3` | 74.3%                          |
-| 6: Vectorized Mem Access            | `18237.3` | 78.4%                          |
-| 9: Autotuning                       | `19721.0` | 84.8%                          |
-| 10: Warptiling                      | `21779.3` | 93.7%                          |
-| 0: cuBLAS                           | `23249.6` | 100.0%                         |
-<!-- benchmark_results -->
+kernel7原代码中尽管使用的float4数据类型从全局内存B中读取，但在LD/ST共享内存Bs时都是考虑单个float数据，考虑的是32个线程的bank conflicts。
+没有按照float4的方式在SMEM上进行LD/ST。
 
-## Setup
+我试着实现了在LD/ST Bs中仍然使用float4的类型，即将4个连续元素看作一组，进行XOR Swizzling，只考虑连续的8个线程没有bank conflicts。
+结果显示，性能与原代码等同。
 
-1. Install dependencies: CUDA toolkit 12, Python (+ Seaborn), CMake, Ninja. See [environment.yml](environment.yml).
-1. Configure NVCC compilation parameters. Look up your GPUs compute
-   capability [here](https://developer.nvidia.com/cuda-gpus). Then configure the `CMakeLists.txt` and change:
-    ```cmake
-    set(CUDA_COMPUTE_CAPABILITY 80)
-    ```
-1. Build: `mkdir build && cd build && cmake .. && cmake --build .`
-1. Run one of the kernels: `DEVICE=<device_id> ./sgemm <kernel number>`
-1. Profiling via [NVIDIA Nsight Compute](https://developer.nvidia.com/nsight-compute) (ncu): `make profile KERNEL=<kernel number>`
-
-Credit goes to [wangzyon/NVIDIA_SGEMM_PRACTICE](https://github.com/wangzyon/NVIDIA_SGEMM_PRACTICE) for the benchmarking setup.
+![](swizzling.jpg)
+可以看出，经过swizzling后，T1...T8分布在不同的bank上，没有造成bank conflicts。
+kernel14仅优化了对Bs的float4访存，对As的布局优化可以参考cutlass的文档。
